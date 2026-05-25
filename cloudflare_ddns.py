@@ -1,389 +1,382 @@
-from urllib3.exceptions import HTTPError as BaseHTTPError
 import sys
 import re
 import json
 import requests
 import random
-import time
 import datetime
 import os
 import argparse
-from pathlib import Path
+import fcntl
+import logging
+import logging.handlers
 '''
 cloudflareDDNS
-This was created so I could update dns records on cloudflare when my IP address changed
-It uses ipify.org api to get your remote IP then updates the specified zone's dns on cloudflare
-Requires Python 3.7 or later
-Brent Russsell
-www.brentrussell.com
-
+Updates Cloudflare A records when the host's public IP changes.
+Requires Python 3.7 or later.
+Brent Russell  —  www.brentrussell.com
 
 Usage:
-    - Using conguration built into cloudflare_ddns.py
-    python3 cloudflare_ddns.py
+    python3 cloudflare_ddns.py /abs/path/to/zones.json
+    python3 cloudflare_ddns.py /abs/path/to/zones.json --force-update
+    python3 cloudflare_ddns.py /abs/path/to/zones.json --dry-run
 
-    - Using an external config file
-    python3 cloudflare_ddns.py /path/to/file/myzones.json
+Exit codes:
+    0 — success (DNS in sync, or no update needed)
+    1 — failure (couldn't get IP, couldn't update one or more records, lock held, etc.)
 '''
 
-# Allows cloudflare_ddns to update even if IP address has not changed
-#       This gives multiple tries to update a domain in case of a previous failure such as network, IO, or OS failures.
-random_force_update = True
+if sys.version_info < (3, 7):
+    sys.exit("Please upgrade to Python 3.7 or later")
 
 
-# ['ZONE', 'RECORD', 'GLOBAL API_KEY at https://dash.cloudflare.com/profile', 'EMAIL@DOMAIN.COM', 'Proxy the domain', 'Enabled' ]
-config = [
-    ["myexample.com", "www.myexample.com", "API_KEY_HERE", "EMAIL@DOMAIN.COM", True, True],
-    ["myexample.com", "@", "API_KEY_HERE", "EMAIL@DOMAIN.COM", True, True],
-    ["ourexample.com", "ourexample.com", "API_KEY_HERE", "EMAIL@DOMAIN.COM", True, True],
-    ["ourexample.com", "*.ourexample.com", "API_KEY_HERE", "EMAIL@DOMAIN.COM", True, True],
-    ["yourexample.com", "home.yourexample.com", "API_KEY_HERE", "EMAIL@DOMAIN.COM", True, True]
-]
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH = os.path.join(SCRIPT_DIR, "cloudflare_ddns.log")
+IP_JSON_PATH = os.path.join(SCRIPT_DIR, "ip.json")
+LOCK_PATH = os.path.join(SCRIPT_DIR, ".cloudflare_ddns.lock")
+IP_HISTORY_MAX = 50
 
 
-if float(str(sys.version_info[0]) + '.' + str(sys.version_info[1])) < 3.6:
-    raise_ex("Please upgrade to Python 3.7 or later", True)
+def _setupLogging():
+    log = logging.getLogger("cloudflare_ddns")
+    log.setLevel(logging.INFO)
+    if log.handlers:
+        return log
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=1_000_000, backupCount=5, encoding='utf-8'
+    )
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S'
+    ))
+    log.addHandler(handler)
+    # Also echo to stdout when run interactively (cron will redirect to /dev/null).
+    if sys.stdout.isatty():
+        stream = logging.StreamHandler(sys.stdout)
+        stream.setFormatter(logging.Formatter('%(levelname)s %(message)s'))
+        log.addHandler(stream)
+    return log
 
 
-def raise_ex(msg, terminate):
-    print(right_now, msg)
-    if terminate:
-        resetIpJson()
-        sys.exit(1)
+log = _setupLogging()
 
 
-def getURL(url, rtype, headers='', payload=''):
-    try:
-        if rtype.lower() == 'put':
-            r = requests.put(url, headers=headers, data=payload)
-        else:
-            r = requests.get(url, headers=headers)
-    except requests.exceptions.Timeout:
-        raise_ex("Connection to " + url + " Timmed out", True)
-    except requests.exceptions.TooManyRedirects:
-        raise_ex(url + " has redirected too many times", True)
-    except requests.exceptions.HTTPError as e:
-        raise_ex('HTTP Error ' + e.response.status_code, True)
-    except (requests.exceptions.ConnectionError, requests.exceptions.RequestException):
-        raise_ex("Connection Error, could not connect to " + url, True)
-    else:
-        return r
+# ----- IP provider lookup -----
 
-
-def getIpProvider():
-    ipProviders = {
-        'https://api.ipify.org?format=json': 'ip',
-        'https://ipapi.co/json/': 'ip',
-        'https://api.bigdatacloud.net/data/client-ip': 'ipString',
-        'https://checkip.amazonaws.com/': '',
-        'https://ifconfig.me/ip': ''
-    }
-    global thisProvider
-    thisProvider = random.choice(list(ipProviders.items()))
-    return thisProvider
+IP_PROVIDERS = {
+    'https://api.ipify.org?format=json': 'ip',
+    'https://ipapi.co/json/': 'ip',
+    'https://api.bigdatacloud.net/data/client-ip': 'ipString',
+    'https://checkip.amazonaws.com/': '',
+    'https://ifconfig.me/ip': ''
+}
 
 
 def validIP(ipString):
-    if re.search(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ipString):
-        return True
-    else:
-        return False
+    return bool(re.search(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ipString))
+
+
+def _tryProvider(provider, key):
+    headers = {'User-Agent': 'Mozilla/5.0 (cloudflare_ddns)'}
+    try:
+        r = requests.get(provider, headers=headers, timeout=10)
+    except requests.exceptions.RequestException as e:
+        log.warning("remoteIP: connection error from %s: %s", provider, e)
+        return None
+    if not r.content:
+        log.warning("remoteIP: no content from %s", provider)
+        return None
+    try:
+        if key:
+            data = json.loads(r.content)
+            val = data.get(key)
+            if val and validIP(val):
+                return val.strip()
+            log.warning("remoteIP: invalid/missing IP from %s", provider)
+            return None
+        text = r.text.strip()
+        if validIP(text):
+            return text
+        log.warning("remoteIP: invalid IP text from %s", provider)
+        return None
+    except json.decoder.JSONDecodeError:
+        log.warning("remoteIP: bad json from %s", provider)
+        return None
 
 
 def remoteIP():
-    try:
-        provider, key = getIpProvider()
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.82 Safari/537.36'}
-        ip = getURL(provider, 'get', headers)
-        if ip.content:
-            if key:
-                data = json.loads(ip.content)
-                if not data[key]:
-                    raise_ex("No IP returned from " + provider, True)
-                elif not validIP(data[key]):
-                    raise_ex("remoteIP method. A valid IP was not returned from " + provider, True)
-                else:
-                    return data[key].strip()
-            elif validIP(ip.text):
-                return ip.text.strip()
-        else:
-            raise_ex("remoteIP method. No content returned from " + provider, True)
-    except KeyError:
-        raise_ex("remoteIP method. Unable to find required key in json response from " + provider, False)
-    except json.decoder.JSONDecodeError:
-        raise_ex("remoteIP method. Not a valid json response from " + provider, True)
+    providers = list(IP_PROVIDERS.items())
+    random.shuffle(providers)
+    for provider, key in providers:
+        ip = _tryProvider(provider, key)
+        if ip:
+            log.info("Public IP %s (from %s)", ip, provider)
+            return ip
+    log.error("All IP providers failed")
+    return None
 
 
-def updateNeeded(remote_ip):
+# ----- ip.json persistence -----
+
+def _migrateLegacy(data):
+    if 'history' in data:
+        return data
+    legacy_date = data.get('date', '')
+    history = []
+    for key in ('lastip1', 'lastip2', 'lastip3', 'lastip4'):
+        ip = data.get(key)
+        if ip and (not history or history[-1]['ip'] != ip):
+            history.append({"ip": ip, "changed_at": legacy_date})
+    return {
+        "currentip": data.get('currentip', '0.0.0.0'),
+        "current_since": legacy_date,
+        "history": history
+    }
+
+
+def readIpJson():
     try:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        file_path = os.path.join(script_dir, "ip.json")
-        ipFile = open(file_path, 'r')
-        ipFilejson = json.load(ipFile)
-        currentip = ipFilejson['currentip']
-        lastip1 = ipFilejson['lastip1']
-        lastip2 = ipFilejson['lastip2']
-        lastip3 = ipFilejson['lastip3']
-        lastip4 = ipFilejson['lastip4']
-        ipFile.close()
+        with open(IP_JSON_PATH, 'r') as f:
+            return _migrateLegacy(json.load(f))
     except FileNotFoundError:
-        raise_ex("updateNeeded method. ip.json was not found", True)
-    except PermissionError:
-        raise_ex("updateNeeded method. Dont have permissions to open ip.json", True)
-    except KeyError:
-        raise_ex("updateNeeded method. Unable to find required keys in ip.json", True)
-    except json.decoder.JSONDecodeError:
-        raise_ex("updateNeeded method. ip.json does not contain proper json", True)
-    if currentip != remote_ip:
-        current_date = datetime.date.today()
-        newjson = {
-            "currentip": remote_ip,
-            "lastip1": currentip,
-            "lastip2": lastip1,
-            "lastip3": lastip2,
-            "lastip4": lastip3,
-            "date": current_date
-        }
-        try:
-            json_object = json.dumps(newjson, sort_keys=True, default=str, indent=4)
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            file_path = os.path.join(script_dir, "ip.json")
-            with open(file_path, "w") as ipFile:
-                ipFile.write(json_object)
-            ipFile.close()
-        except PermissionError:
-            raise_ex("Dont have permissions to write to ip.json", True)
+        log.warning("ip.json not found; initializing")
+        return {"currentip": "0.0.0.0", "current_since": "", "history": []}
+    except (PermissionError, json.decoder.JSONDecodeError) as e:
+        log.error("Cannot read ip.json: %s", e)
+        return None
+
+
+def _writeIpJson(data):
+    try:
+        with open(IP_JSON_PATH, "w") as f:
+            f.write(json.dumps(data, sort_keys=True, default=str, indent=4))
         return True
-    else:
+    except (PermissionError, OSError) as e:
+        log.error("Cannot write ip.json: %s", e)
         return False
 
 
-def resetIpJson():
+def persistIp(remote_ip):
+    """Only call after a successful Cloudflare update."""
+    data = readIpJson()
+    if data is None:
+        return False
+    currentip = data.get('currentip', '0.0.0.0')
+    if currentip == remote_ip:
+        return True
+    now = datetime.datetime.now().isoformat(timespec='seconds')
+    history = data.get('history', [])
+    if not history or history[0].get('ip') != currentip:
+        history.insert(0, {"ip": currentip, "changed_at": data.get('current_since', '')})
+    history = history[:IP_HISTORY_MAX]
+    return _writeIpJson({
+        "currentip": remote_ip,
+        "current_since": now,
+        "history": history
+    })
+
+
+# ----- Cloudflare API -----
+
+def _cfRequest(method, url, headers, payload=None):
     try:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        file_path = os.path.join(script_dir, "ip.json")
-        ipFile = open(file_path, 'r')
-        ipFilejson = json.load(ipFile)
-        ipFile.close()
-        newjson = {
-            "currentip": '0.0.0.0',
-            "date": ipFilejson['date'],
-            "lastip1": ipFilejson['lastip1'],
-            "lastip2": ipFilejson['lastip2'],
-            "lastip3": ipFilejson['lastip3'],
-            "lastip4": ipFilejson['lastip4']
-        }
-        json_object = json.dumps(newjson, sort_keys=True, default=str, indent=4)
-        with open(file_path, "w") as ipFile:
-            ipFile.write(json_object)
-        ipFile.close()
-    except PermissionError:
-        raise_ex("Dont have permissions to write to ip.json", True)
+        if method == 'put':
+            r = requests.put(url, headers=headers, data=payload, timeout=15)
+        else:
+            r = requests.get(url, headers=headers, timeout=15)
+        return r
+    except requests.exceptions.RequestException as e:
+        log.error("Cloudflare %s %s failed: %s", method.upper(), url, e)
+        return None
 
 
 def zoneData(headers, zone):
+    r = _cfRequest('get', 'https://api.cloudflare.com/client/v4/zones?name=' + zone, headers)
+    if r is None:
+        return None
     try:
-        zoneURL = 'https://api.cloudflare.com/client/v4/zones?name=' + zone
-        data = getURL(zoneURL, 'get', headers)
-        zone_data = json.loads(data.content)
-        if len(zone_data['result']) > 0:
-            if not zone_data['result'][0]['id']:
-                raise_ex('zoneData method. Zone ' + zone + ' not found', False)
-            else:
-                return zone_data['result'][0]['id']
-        else:
-            return False
+        data = json.loads(r.content)
+        results = data.get('result') or []
+        if results and results[0].get('id'):
+            return results[0]['id']
+        log.error("Zone %s not found", zone)
+        return None
     except json.decoder.JSONDecodeError:
-        raise_ex("zoneData method. Not a valid json response from Cloudflare", False)
-    except TypeError:
-        raise_ex("zoneData method. TypeError. This usually happens when the record does not exist", False)
-    except KeyError:
-        raise_ex("zoneData method. Unable to find result key in json response from Cloudflare", False)
+        log.error("Invalid JSON from Cloudflare zones endpoint for %s", zone)
+        return None
 
 
 def recordData(headers, zone_id, record):
+    r = _cfRequest('get', 'https://api.cloudflare.com/client/v4/zones/' + zone_id + '/dns_records?name=' + record, headers)
+    if r is None:
+        return None
     try:
-        data = getURL('https://api.cloudflare.com/client/v4/zones/' + zone_id + '/dns_records?name=' + record, 'get', headers)
-        record_data = json.loads(data.content)
-        print(record)
-        if len(record_data['result']) > 0:
-            if not record_data['result'][0]['id']:
-                raise_ex('recordData method. Record ' + record + ' not found', False)
-            else:
-                return record_data['result'][0]['id']
-        else:
-            return False
+        data = json.loads(r.content)
+        results = data.get('result') or []
+        if results and results[0].get('id'):
+            return results[0]['id']
+        log.error("Record %s not found", record)
+        return None
     except json.decoder.JSONDecodeError:
-        raise_ex("recordData method. Not a valid json response from Cloudflare", False)
-    except KeyError:
-        raise_ex("recordData method. Unable to find result key in json response from Cloudflare", False)
-    except TypeError:
-        raise_ex("recordData method. TypeError. This usually happens when the record does not exist", False)
-
-
-def listToDict(lst):
-    op = {lst[i]: lst[i + 1] for i in range(0, len(lst), 2)}
-    return op
+        log.error("Invalid JSON from Cloudflare records endpoint for %s", record)
+        return None
 
 
 def updateRecord(headers, zone_id, record, record_id, remote_ip, proxied_state):
+    payload = json.dumps(dict(type="A", name=record, content=remote_ip, ttl=1, proxied=proxied_state))
+    r = _cfRequest('put', 'https://api.cloudflare.com/client/v4/zones/' + zone_id + '/dns_records/' + record_id, headers, payload)
+    if r is None:
+        return 'request failed'
     try:
-        payload = dict(type="A", name=record, content=remote_ip, ttl=1, proxied=proxied_state)
-        data = getURL('https://api.cloudflare.com/client/v4/zones/' + zone_id + '/dns_records/' + record_id, 'put', headers, json.dumps(payload))
-        update = json.loads(data.content)
-        if update['success']:
-            return 'success'
-        else:
-            return update['errors'][0]['message']
-    except KeyError:
-        raise_ex("updateRecord method. Unable to find required key in json response from Cloudflare api", False)
+        data = json.loads(r.content)
     except json.decoder.JSONDecodeError:
-        raise_ex("updateRecord method. Not a valid json response from Cloudflare api", False)
-    except TypeError:
-        raise_ex("updateRecord method. TypeError. This usually happens when the record does not exist", False)
+        return 'invalid json response'
+    if data.get('success'):
+        return 'success'
+    errors = data.get('errors') or []
+    if errors and isinstance(errors[0], dict) and 'message' in errors[0]:
+        return errors[0]['message']
+    return 'unknown error from Cloudflare api'
 
 
-def argvs():
-    n = len(sys.argv)
-    if not n > 1:
-        return config
-    elif n > 2:
-        raise_ex("1 argument expected, more than 1 passed", True)
-    else:
-        parser = argparse.ArgumentParser()
-        parser.add_argument("configFile")
-        args = parser.parse_args()
-        if not os.path.isfile(args.configFile):
-            raise_ex("The passed config file does not exist", True)
+# ----- Config / CLI -----
+
+CONFIG_DEFAULTS = ['', '', '', '', False, True]
+CONFIG_KEYS = {
+    'zone': 0,
+    'record': 1,
+    'global_api_key': 2,
+    'cloudflare_email': 3,
+    'proxied_state': 4,
+    'enabled': 5,
+}
+
+
+def loadConfig(path):
+    if not os.path.isfile(path):
+        log.error("Config file does not exist: %s", path)
+        return None
+    try:
+        with open(path, 'r') as f:
+            zoneFilejson = json.load(f)
+    except (PermissionError, FileNotFoundError, json.decoder.JSONDecodeError) as e:
+        log.error("Cannot read config %s: %s", path, e)
+        return None
+    out = []
+    for item in zoneFilejson:
+        row = list(CONFIG_DEFAULTS)
+        for key, idx in CONFIG_KEYS.items():
+            if key in item:
+                row[idx] = item[key]
+        if not row[0] or not row[2] or not row[3]:
+            log.error("Skipping malformed config entry: %s", item)
+            continue
+        out.append(row)
+    return out
+
+
+def parseArgs():
+    parser = argparse.ArgumentParser(description='Cloudflare DDNS updater')
+    parser.add_argument('configFile', type=str, help='Path to the zones JSON config (absolute path recommended for cron)')
+    parser.add_argument('--force-update', action='store_true', help='Force update even if IP has not changed')
+    parser.add_argument('--dry-run', action='store_true', help='Check IP and records but do not PUT to Cloudflare')
+    return parser.parse_args()
+
+
+# ----- Main -----
+
+def _acquireLock():
+    """Returns the open lock file handle, or None if another run holds it."""
+    f = open(LOCK_PATH, 'w')
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except BlockingIOError:
+        f.close()
+        return None
+
+
+def run(args):
+    config = loadConfig(args.configFile)
+    if not config:
+        log.error("No usable config entries; aborting")
+        return 1
+
+    remote_ip = remoteIP()
+    if not remote_ip:
+        return 1
+
+    data = readIpJson()
+    if data is None:
+        return 1
+    currentip = data.get('currentip', '0.0.0.0')
+    needs_update = args.force_update or (currentip != remote_ip)
+
+    if not needs_update:
+        log.info("No update needed. Public IP %s unchanged.", remote_ip)
+        return 0
+
+    if args.dry_run:
+        log.info("DRY RUN — would update %d record(s) to %s", len(config), remote_ip)
+        return 0
+
+    total_updates = 0
+    total_errors = 0
+    for zone, record, api_key, email, proxied, enabled in config:
+        if not enabled:
+            log.info("%s: not enabled, skipping", record)
+            continue
+        if record in ('', '@', '.'):
+            record = zone
+        headers = {
+            'Content-Type': 'application/json',
+            'X-Auth-Key': api_key,
+            'X-Auth-Email': email,
+        }
+        zone_id = zoneData(headers, zone)
+        if not zone_id:
+            total_errors += 1
+            continue
+        record_id = recordData(headers, zone_id, record)
+        if not record_id:
+            total_errors += 1
+            continue
+        result = updateRecord(headers, zone_id, record, record_id, remote_ip, proxied)
+        if result == 'success':
+            log.info("Updated %s -> %s", record, remote_ip)
+            total_updates += 1
+        elif result and re.search('already exists', result, flags=re.IGNORECASE):
+            log.info("%s already at %s", record, remote_ip)
+            total_updates += 1
         else:
-            try:
-                h = open(args.configFile, 'r')
-                zoneFilejson = json.load(h)
-                h.close()
-            except FileNotFoundError:
-                raise_ex("argvs method. " + args.configFile + " was not found", True)
-            except PermissionError:
-                raise_ex("argvs method. Invalid permissions trying to open " + args.configFile, True)
-            except json.decoder.JSONDecodeError:
-                raise_ex("argvs method. " + args.configFile + " is not a valid json file", True)
-            outer = 0
-            outerConfig = []
-            for item in zoneFilejson:
-                innerConfig = []
-                innerConfig.extend([0, 1, 2, 3, 4, 5])
-                for key in item:
-                    if key == 'zone':
-                        innerConfig[0] = zoneFilejson[outer][key]
-                    elif key == 'record':
-                        innerConfig[1] = zoneFilejson[outer][key]
-                    elif key == 'global_api_key':
-                        innerConfig[2] = zoneFilejson[outer][key]
-                    elif key == 'cloudflare_email':
-                        innerConfig[3] = zoneFilejson[outer][key]
-                    elif key == 'proxied_state':
-                        innerConfig[4] = zoneFilejson[outer][key]
-                    elif key == 'enabled':
-                        innerConfig[5] = zoneFilejson[outer][key]
-                    else:
-                        continue
-                    # innerConfig.append(zoneFilejson[outer][key])
-                outerConfig.append(innerConfig)
-                outer += 1
-            # print("Updating DNS records from", args.configFile)
-            return outerConfig
+            log.error("Failed to update %s -> %s: %s", record, remote_ip, result)
+            total_errors += 1
 
+    log.info("Results: %d updated, %d error(s)", total_updates, total_errors)
 
-def clear_log():
-    # Clears a log if written to by cron with >> /path/to/cloudflare_ddns/cloudflare_ddns.log at the end of the cronjob
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(script_dir, "cloudflare_ddns.log")
-    current_time = datetime.datetime.now().time()
-    current_day = datetime.datetime.today().weekday()
-    start_time = datetime.time(3, 20)
-    end_time = datetime.time(3, 30)
-    if current_day == 2 and start_time <= current_time <= end_time:
-        with open(file_path, "w") as file:
-            file.write("")
-
-
-def rightNow():
-    global right_now
-    current_time = time.localtime()
-    right_now = time.strftime("%Y-%m-%d %I:%M %p", current_time)
-    return right_now
-
-
-def init():
-    # Create global time to be used
-    rightNow()
-    # Check if we need to clear the log file
-    clear_log()
+    if total_errors == 0 and total_updates > 0:
+        if not persistIp(remote_ip):
+            return 1
+        return 0
+    # Any errors → leave ip.json alone so next run retries, and signal failure.
+    return 1
 
 
 def main():
-    # Get the remote IP of this machine
-    remote_ip = remoteIP()
-    # Decide if the new IP is different than the last
-    newIPDetected = updateNeeded(remote_ip)
-    # Even if it is not differnet, lets force an update on avg once ever 4hrs
-    updateDNS = False
-    if not newIPDetected:
-        if random.randint(1, 240) == 100:
-            updateDNS = True
-    else:
-        updateDNS = True
-    if updateDNS:
-        total_updates = 0
-        total_errors = 0
-        if len(remote_ip) > 6:
-            for i in range(len(config)):
-                # Set headers to be used with cloudflare
-                headers = {
-                    'Content-Type': 'application/json',
-                    'X-Auth-Key': config[i][2],
-                    'X-Auth-Email': config[i][3]
-                }
-                zone_id = zoneData(headers, config[i][0])  # Get Zone ID
-                if i == 0:
-                    print('\n Starting....\n', right_now, '\n')
-                if i > 0:
-                    print('-----------------------------------------\n')
-                if zone_id:
-                    if config[i][1] == '' or config[i][1] == '@' or config[i][1] == '.':  # If there is no sub domain
-                        config[i][1] = config[i][0]
-                    record_id = recordData(headers, zone_id, config[i][1])  # Get record ID
-                    if record_id:
-                        if not config[i][5]:
-                            print(right_now, config[i][1], "Not enabled, skipping.")
-                            continue
-                        try:
-                            results = updateRecord(headers, zone_id, config[i][1], record_id, remote_ip, config[i][4])
-                        except IndexError:
-                            total_errors += 1
-                            raise_ex("Index Error occurred, Check configuration values", False)
-                        if results == 'success':
-                            print(right_now, 'DNS for ' + config[i][1] + ' updated to ' + remote_ip)
-                            total_updates += 1
-                        else:
-                            exists = re.search('already exists', results, flags=re.IGNORECASE)
-                            if exists is not None:
-                                print(right_now, 'DNS for ' + config[i][1] + ' already updated to ' + remote_ip)
-                                total_updates += 1
-                            else:
-                                print(right_now, 'Error updating DNS for ' + config[i][1] + ' to ' + remote_ip + ':' + results)
-                    else:
-                        print(right_now, 'Error getting record id for ' + config[i][1] + ', DNS not updated')
-                        total_errors += 1
-                else:
-                    print('Error getting zone id for ' + config[i][0] + ', DNS not updated')
-                    total_errors += 1
-            print(f'\n################# RESULTS #################\n{total_updates} record(s) updated and {total_errors} error(s)\n')
-        else:
-            print(right_now, "Could not obtain current remote IP")
-    else:
-        print(right_now, 'No updated needed.', thisProvider[0], 'reports Ip address', remote_ip, 'which has not changed')
+    args = parseArgs()
+    lock = _acquireLock()
+    if lock is None:
+        log.warning("Another cloudflare_ddns run is in progress; exiting")
+        sys.exit(1)
+    try:
+        rc = run(args)
+    except Exception:
+        log.exception("Unhandled exception")
+        rc = 1
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+    sys.exit(rc)
 
 
-config = argvs()
-init()
-main()
+if __name__ == '__main__':
+    main()

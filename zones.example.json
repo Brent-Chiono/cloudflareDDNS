@@ -1,0 +1,18 @@
+[
+    {
+        "zone": "example.com",
+        "record": "@",
+        "global_api_key": "YOUR_CLOUDFLARE_GLOBAL_API_KEY",
+        "cloudflare_email": "you@example.com",
+        "proxied_state": true,
+        "enabled": true
+    },
+    {
+        "zone": "example.com",
+        "record": "home.example.com",
+        "global_api_key": "YOUR_CLOUDFLARE_GLOBAL_API_KEY",
+        "cloudflare_email": "you@example.com",
+        "proxied_state": false,
+        "enabled": true
+    }
+]
